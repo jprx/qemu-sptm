@@ -7,6 +7,7 @@
 
 #define PACIBSP                (( 0xD503237F ))
 #define RETAB                  (( 0xD65F0FFF ))
+#define BTI_C                  (( 0xD503245F ))
 #define MOVX(rd,v)             (( 0xD2800000 | ( ((v)) << 5) | ((rd)) ))
 
 #define IS_LDG(v)              (( (0b11011001011 == (((v)) >> 21)) && (0 == ((((v)) >> 10) & 0b011)) ))
@@ -82,8 +83,9 @@ static void patch_img4_deadlock(u8 *bkc_macho) {
 
     u32 *sysctl_handler_fn = (u32*)&bkc_macho[oid_handler];
 
-    if (PACIBSP != sysctl_handler_fn[0]) {
-        fprintf(stderr, "Warning: _darwin_trap_ignition_get_blob doesn't start with PACIBSP\n");
+    if (PACIBSP != sysctl_handler_fn[0] && BTI_C != sysctl_handler_fn[0]) {
+        fprintf(stderr, "Warning: _darwin_trap_ignition_get_blob doesn't start with PACIBSP or BTI C\n");
+        fprintf(stderr, "opcode: 0x%X\n", sysctl_handler_fn[0]);
     }
 
     sysctl_handler_fn[0] = PACIBSP;

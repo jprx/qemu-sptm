@@ -110,7 +110,7 @@ void apple_regs_init(ARMCPU *cpu, AMCCState *amcc, struct dtree_node *dt_root, s
     // iPhone 13 and 14 rorgn_start and rorgn_end come from ctrr A
     // If these are not correct, you'll get the following:
     // panic(cpu 0 caller ...): zalloc_ro_mut failed: source (...) not from RO zone map (...), current stack (...) or const memory (phys 0 - 0xfff) @zalloc.c:6733
-    // the giveaway here is "cosnt memory" being from 0 to 0xfff- this is what happens when a CTRR region is from [0,0].
+    // the giveaway here is "const memory" being from 0 to 0xfff- this is what happens when a CTRR region is from [0,0].
     APPLE_STATE(env)->ctrr_a_lwr_el2 = REGION_START("BootKC-rx");
     APPLE_STATE(env)->ctrr_a_upr_el2 = REGION_END("BootKC-rs");
 

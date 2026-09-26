@@ -8,11 +8,6 @@
 #define TYPE_AMCC "amcc"
 OBJECT_DECLARE_SIMPLE_TYPE(AMCCState, AMCC)
 
-// Keep this in sync with dt_fixup.py; we define where each CTRR reg is within
-// the AMCC MMIO region (called the "aperture") via dtree entries. I call the
-// different AMCC subregions "banks". There are four of them: amcc-ctrr-a,
-// amcc-ctrr-b, amcc-ctrr-c, and amcc-ctrr-d.
-
 enum {
     AMCC_BANK_A           =   0,
     AMCC_BANK_B           =   1,

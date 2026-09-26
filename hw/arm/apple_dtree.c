@@ -12,7 +12,7 @@
  *
  * Intentionally provides no capability of creating new nodes or resizing
  * existing nodes. Assumes that device trees we get were run through
- * dt_decompiler -> dt_fixup -> dt_compiler.
+ * dt_fixup from the darwin-vm main repository.
  */
 
 #define ROUND_DOWN_POW2(x,sz)      ((       (x)        & (~((sz) - 1)) ))

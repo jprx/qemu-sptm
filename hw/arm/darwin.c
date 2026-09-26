@@ -21,12 +21,13 @@
 #include "hw/arm/apple_amcc.h"
 #include "xnu/patch.h"
 #include "xnu/macho.h"
+#include "hw/intc/apple_aic.h"
 
 // See device tree specification section 2.3.8: ranges
 #define IO_RANGE_BASE_OFFSET     1
 
-// Use this for AICs where we don't know how many interrupts there should be
-#define A_GOOD_NUMBER_OF_IRQS    0x1000
+// Apple hardcodes this in the Samsung serial driver kext
+#define EXPECTED_UART_FIFO_DEPTH 0x10
 
 #define EXPECTED_FIRMWARE_NAME   "qemu-sptm"
 
@@ -38,10 +39,19 @@ static char *g_default_args = (char*)"debug=0x8 kextlog=0xffff cpus=1 rd=md0 ser
 #define TYPE_DARWIN_MACHINE MACHINE_TYPE_NAME("darwin")
 OBJECT_DECLARE_SIMPLE_TYPE(DarwinState, DARWIN_MACHINE)
 
+#define IRQ_QEMUPORT_(d)            ((d))
+#define TUNNEL_UART_NAME            "qemuport"
+#define NUM_TUNNEL_DEVICES          4
+
+#define DARWIN_MACHINE_NUM_IRQS     NUM_TUNNEL_DEVICES
+
 struct DarwinState {
-    MachineState parent_obj;
-    ARMCPU *cpu;
-    struct xnu_boot_info bootinfo;
+    MachineState           parent_obj;
+    ARMCPU                *cpu;
+    AMCCState             *amcc;
+    DeviceState           *aic;
+    struct xnu_boot_info   bootinfo;
+    qemu_irq               irqs[DARWIN_MACHINE_NUM_IRQS];
 };
 
 MACHINE_CLASS_ARG(bootkc);
@@ -119,10 +129,18 @@ static void init_cpu_impl(struct dtree_node *dt_root) {
     alloc_zeroed("cpm_reg_impl", cpm_impl[0].base, cpm_impl[0].len);
 }
 
-static void init_uart(struct dtree_node *dt_root, uint64_t iobase) {
-    struct dtree_node *uart = adt_find_node(dt_root, "arm-io/uart0");
+static u32 armio_get_irqnum(struct dtree_node *node) {
+    u32 *irqnum = adt_get_prop_val(node, "interrupts");
+    if (!irqnum) {
+        fprintf(stderr, "missing interrupts property for device\n");
+        exit(1);
+    }
+    return irqnum[0];
+}
+
+static void init_uart(struct dtree_node *uart, uint64_t iobase, Chardev *cdev, qemu_irq irq) {
     struct adt_io_reg *uart_reg = adt_get_prop_val(uart, "reg");
-    exynos4210_uart_create(uart_reg[0].base + iobase, 16, 0, serial_hd(0), 0);
+    exynos4210_uart_create(uart_reg[0].base + iobase, EXPECTED_UART_FIFO_DEPTH, 0, cdev, irq);
 }
 
 static void init_sep(struct dtree_node *dt_root) {
@@ -134,40 +152,6 @@ static void init_sep(struct dtree_node *dt_root) {
     struct adt_io_reg *sep_reg = adt_get_prop_val(sep, "reg-block");
 
     alloc_zeroed("sep", sep_reg[0].base, sep_reg[0].len);
-}
-
-static void init_aic(struct dtree_node *dt_root, uint64_t iobase) {
-    // This is a bare-bones aic implementation that ignores all register reads/
-    // writes, and simply reports the correct number of IRQs
-    struct dtree_node *aic = adt_find_node(dt_root, "arm-io/aic");
-    struct adt_io_reg *aic_reg = adt_get_prop_val(aic, "reg");
-
-    uint64_t base = aic_reg[0].base + iobase;
-    alloc_zeroed("aic", base, aic_reg[0].len);
-
-    int aic_vers = -1;
-    sscanf(adt_get_prop_val(aic, "compatible"), "aic,%d", &aic_vers);
-
-    uint32_t num_irqs = 0;
-    switch (aic_vers) {
-        case 1:
-            // aic,1 needs register +0x04 from first iobase to report the number of interrupts
-            // This is always 8x the size of the ipid-mask for this device
-            num_irqs = 8 * adt_get_prop_len(aic, "ipid-mask");
-            address_space_write(&address_space_memory, base + 0x4, MEMTXATTRS_UNSPECIFIED, &num_irqs, sizeof(num_irqs));
-            break;
-
-        case 2:
-        case 3:
-            // aic,2 and aic,3 have num irqs at +0xC
-            num_irqs = A_GOOD_NUMBER_OF_IRQS;
-            address_space_write(&address_space_memory, base + 0xC, MEMTXATTRS_UNSPECIFIED, &num_irqs, sizeof(num_irqs));
-            break;
-
-        default:
-            fprintf(stderr, "warning: unsupported AIC, this will probably not work\n");
-            break;
-    }
 }
 
 static void setup_mte(Object *cpuobj, MachineState *machine, struct xnu_boot_info *info) {
@@ -260,19 +244,34 @@ static void darwin_init(MachineState *ms) {
     if (info->has_mte) setup_mte(cpuobj, MACHINE(s), info);
 
     struct dtree_node *amcc_node = adt_find_node(dt_root, "chosen/lock-regs/amcc");
-    AMCCState *amcc_dev = NULL;
-    if (amcc_node) {
-        amcc_dev = (AMCCState*)amcc_create(amcc_node);
-    }
-    apple_regs_init(cpu, amcc_dev, dt_root, info);
+    s->amcc = amcc_node ? (AMCCState*)amcc_create(amcc_node) : NULL;
+    apple_regs_init(cpu, s->amcc, dt_root, info);
 
     struct dtree_node *arm_io = adt_find_node(dt_root, "arm-io");
     uint64_t *arm_io_ranges = adt_get_prop_val(arm_io, "ranges");
     uint64_t iobase = arm_io_ranges[IO_RANGE_BASE_OFFSET];
     assert(0 == arm_io_ranges[0]); // child bus phys addr must be zero
 
-    init_uart(dt_root, iobase);
-    init_aic(dt_root, iobase);
+    s->aic = apple_aic_create(adt_find_node(dt_root, "arm-io/aic"), iobase);
+
+    struct dtree_node *uart0 = adt_find_node(dt_root, "arm-io/uart0");
+    if (!uart0) {
+        fprintf(stderr, "error: no uart0 in device tree\n");
+        exit(1);
+    }
+    init_uart(uart0, iobase, serial_hd(0), NULL);
+
+    for (int i = 0; i < NUM_TUNNEL_DEVICES; i++) {
+        char tunnel_devname[32];
+        snprintf(tunnel_devname, sizeof(tunnel_devname), "arm-io/%s%d", TUNNEL_UART_NAME, i);
+        struct dtree_node *port = adt_find_node(dt_root, tunnel_devname);
+        if (port) {
+            u32 irqnum = armio_get_irqnum(port);
+            s->irqs[IRQ_QEMUPORT_(i)] = qdev_get_gpio_in(s->aic, irqnum);
+            init_uart(port, iobase, serial_hd(1+i), s->irqs[IRQ_QEMUPORT_(i)]);
+        }
+    }
+
     init_sep(dt_root);
     init_cpu_impl(dt_root);
 
@@ -283,7 +282,9 @@ static void darwin_init(MachineState *ms) {
     qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
 
     // On Apple Si, FIQ is hardwired to platform timer
+    // Hardwire IRQ to the AIC
     qdev_connect_gpio_out(cpudev, GTIMER_HYPVIRT, qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+    qdev_connect_gpio_out(s->aic, 0, qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
 
     qemu_register_reset(do_darwin_reset, s);
     munmap(info->bootkc_f.buf, info->bootkc_f.len);
